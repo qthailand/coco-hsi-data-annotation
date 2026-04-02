@@ -344,20 +344,21 @@ def build_coco_annotation_json_from_layers(layers, classes=None, image_id=1, fil
             break
 
     coco = {
+        
         "info": {
-            "description": "COCO 2017 Dataset",
-            "url": "http://cocodataset.org",
-            "version": "1.0",
-            "year": 2017,
-            "contributor": "COCO Consortium",
-            "date_created": "2017/09/01",
-        },
+        "description": "HSI Dataset with COCO-style Annotations",
+        "url": "https://github.com/qthailand/coco-hsi-data-annotation",
+        "version": "1.0",
+        "year": 2026,
+        "contributor": "National Astronomical Research Institute of Thailand (Public Organization) And Prince of Songkla University, Thailand",
+        "date_created": "2026/04/02"
+        },  
         "licenses": [
-            {
-                "url": "http://creativecommons.org/licenses/by/2.0/",
-                "id": 4,
-                "name": "Attribution License",
-            }
+        {
+            "id": 1,
+            "name": "Creative Commons Attribution 4.0",
+            "url": "https://creativecommons.org/licenses/by/4.0/"
+        }
         ],
         "images": [
             {
