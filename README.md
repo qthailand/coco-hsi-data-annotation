@@ -99,6 +99,10 @@ pip install matplotlib imageio
 - ถ้าไม่มี OpenCV (`cv2`) การคำนวณ segmentation polygon จาก mask จะ fallback เป็น bbox rectangle
 - หากไม่มี `wavelength` ใน metadata จะใช้ default SWIR/VIS lookup
 
+## Resuts From Annotation
+### Cube RGB
+![image](https://github.com/qthailand/coco-hsi-data-annotation/blob/main/test_script/turmeric.png)
+### Result
 ![image](https://github.com/qthailand/coco-hsi-data-annotation/blob/main/test_script/coco_ann_ann_1.png)
 ![image](https://github.com/qthailand/coco-hsi-data-annotation/blob/main/test_script/coco_ann_ann_2.png)
 ![image](https://github.com/qthailand/coco-hsi-data-annotation/blob/main/test_script/coco_ann_ann_3.png)
