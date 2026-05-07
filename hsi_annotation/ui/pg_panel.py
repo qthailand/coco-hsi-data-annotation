@@ -16,27 +16,11 @@ class PgPanel(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        header = QLabel("📊  PyQtGraph – GT Mask & Spectrum")
-        header.setAlignment(Qt.AlignCenter)
-        header.setStyleSheet(
-            "font-weight:bold; font-size:13px; padding:5px;"
-            "background:#2b2b2b; color:#e0e0e0; border-radius:4px;"
-        )
-        layout.addWidget(header)
-
         self._img_view = pg.ImageView()
         self._img_view.ui.roiBtn.hide()
         self._img_view.ui.menuBtn.hide()
         self._img_view.ui.roiPlot.hide()
         layout.addWidget(self._img_view, stretch=3)
-
-        spectrum_label = QLabel("📈  Spectrum at Cursor")
-        spectrum_label.setAlignment(Qt.AlignCenter)
-        spectrum_label.setStyleSheet(
-            "font-weight:bold; color:#ccc; background:#2b2b2b;"
-            "padding:3px; border-radius:3px;"
-        )
-        layout.addWidget(spectrum_label)
 
         self._spec_plot = pg.PlotWidget()
         self._spec_plot.setBackground("#1e1e1e")
@@ -62,8 +46,14 @@ class PgPanel(QWidget):
 
     def update_from_mask(self, mask):
         arr = self._to_np(mask)
+        # Composite RGBA mask over white background so label colors remain visible
+        rgba = arr[:, :, :4].astype(np.uint8)
+        rgb = rgba[:, :, :3].astype(np.float32)
+        alpha = (rgba[:, :, 3].astype(np.float32) / 255.0)[:, :, None]
+        bg = 255.0
+        comp = (rgb * alpha + bg * (1.0 - alpha)).clip(0, 255).astype(np.uint8)
         self._img_view.setImage(
-            arr[:, :, :3],
+            comp,
             autoRange=self._first,
             autoLevels=self._first,
             autoHistogramRange=self._first,

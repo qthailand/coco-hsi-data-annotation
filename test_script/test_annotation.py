@@ -169,15 +169,15 @@ def render_coco_annotations(coco, coco_json_path=None, show=True, save_prefix=No
         ax.set_ylim(height, 0)
         ax.axis("off")
 
-        if save_prefix:
-            save_path = f"{save_prefix}_ann_{annotation_id}.png"
-            fig.savefig(save_path, bbox_inches="tight")
-            print(f"saved: {save_path}")
+        # if save_prefix:
+        #     save_path = f"{save_prefix}_ann_{annotation_id}.png"
+        #     fig.savefig(save_path, bbox_inches="tight")
+        #     print(f"saved: {save_path}")
 
         if show:
             plt.show()
 
-        plt.close(fig)
+        # plt.close(fig)
 
 
 def test_coco_annotation_rendering(path=None):

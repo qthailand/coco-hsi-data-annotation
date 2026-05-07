@@ -1,109 +1,89 @@
-# HSI Data Annotation (COCO-HSI Data Annotation)
+# HSI Data Annotation
 
-โปรเจคนี้เป็น Desktop GUI แอปสำหรับสร้างและแก้ไข Ground Truth Annotation ของ Hyperspectral Image (HSI) แบบ pixel-level
-โฟกัสในงาน classification mask และส่งออกทั้งเป็นไฟล์ภาพและ COCO-style JSON
+A desktop GUI application for annotating hyperspectral imaging (HSI) datacubes with pixel-level classification masks.
 
-## ✅ ไฮไลต์ฟีเจอร์หลัก
+## Features
 
-- โหลด hyperspectral datacube แบบ ENVI (`.hdr`) แล้วประมวลผล preview RGB
-- คำนวณ band RGB จาก metadata หรือ default bands (R=29, G=19, B=9) และปรับด้วย percentile stretch
-- ปักหมุด (paint) แยก layer/tag รองรับ class ID, class name, color ปรับแต่งได้
-- Tools:
-  - Cursor (move/resize / lock/unlock layer)
-  - Connect/Polygon fill (v4 path closure)
-  - Circle drawing
-  - Pen (freehand), Eraser
-  - Flood fill (ใช้งานอยู่ใน mode connect ใน canvas)
-- เลือก class ผ่าน dropdown toolbar และ class table (ซ่อนจาก UI ปกติ แต่เรียกใช้งานได้)
-- ดู spectrum ที่ cursor -> plot พร้อม class-avg spectra (รันใน thread เพื่อไม่ล็อก UI)
-- ปรับ RGB contrast ด้วย low/high percentile (`2.0 - 98.0` ค่า default)
-- บันทึก output เป็น:
-  - PNG/TIFF grayscale (ค่าพิกเซล=class ID, 0=background)
-  - COCO JSON (annotations polygon จาก mask หรือ bbox fallback)
+- Load ENVI hyperspectral image files (`.hdr` format)
+- Build RGB preview from wavelength metadata using target channels R=645 nm, G=555 nm, B=465 nm
+- Paint pixels with customizable class labels and colors
+- View spectral reflectance curves at cursor position
+- Flood-fill connected regions
+- Adjust RGB contrast with configurable low/high percentile cuts for dark datacubes
+- Save ground truth masks as PNG or TIFF files
 
-## 🧩 โครงสร้างไฟล์
+## Requirements
 
-- `__main__.py` - entry point (`python -m __main__`)
-- `hsi_annotation/app.py` - PyQt5 application bootstrap
-- `hsi_annotation/canvas.py` - drawing logic, layer/mask management, input event handling
-- `hsi_annotation/data.py` - datacube loading, RGB preview, class spectra, COCO conversion
-- `hsi_annotation/ui/window.py` - main window, toolbar, status bar, save/open dialogs
-- `hsi_annotation/ui/class_table.py` - class label manager
-- `hsi_annotation/ui/paint_view.py` - zoom/pan view
-- `hsi_annotation/ui/pg_panel.py` - mask preview + spectrum plot
-- `test_script` - ตัวอย่างงานและสคริปต์ตรวจสอบ COCO JSON เดโม (รวม `test_annotation.py`)
+- Python 3.7+
+- [PyQt5](https://pypi.org/project/PyQt5/)
+- [NumPy](https://numpy.org/)
+- [spectral](https://www.spectralpython.net/)
+- [pyqtgraph](https://www.pyqtgraph.org/)
 
-## 📦 ติดตั้ง
-
-แนะนำ Python 3.7+ (ทดสอบกับ 3.10 ขึ้นไป)
+## Installation
 
 ```bash
 pip install PyQt5 numpy spectral pyqtgraph
-``` 
-
-สำหรับ `test_script` (optional):
-
-```bash
-pip install matplotlib imageio
 ```
 
-### Shortcuts ที่มีในระบบ
+## Usage
 
-- `Ctrl+O` เปิดไฟล์ `.hdr`
-- `Ctrl+N` ล้าง GT layer ทั้งหมด
-- `Ctrl+S` บันทึกเป็น PNG/TIFF/JSON
-- `Ctrl+Shift+C` สร้าง class ใหม่
-- `L` เปลี่ยนไปเครื่องมือ Connect
-- `C` เครื่องมือ Circle
-- `T` เพิ่ม Tag (Layer) ใหม่
-- `Ctrl+U` Cursor tool
-- `Ctrl+=` / `Ctrl+-` / `Ctrl+0` Zoom in/out/reset
-- `Ctrl+F` Fit
-- `Ctrl+Wheel` Zoom (fast)
-- ปุ่มเมาส์กลางลากเพื่อ pan
+```bash
+python -m __main__
+```
 
-## 🗂️ รูปแบบไฟล์ที่รองรับ
+### Toolbar Tools
 
-- Input: ENVI datacube (`.hdr` + data file เช่น `.bip` / `.bsq` / `.bil`)
-- Output:
-  - PNG/TIFF mask (8-bit grayscale, pixel value = class ID)
-  - COCO JSON (ใน `save` dialog เลือก `.json`)
+| Tool | Shortcut | Description |
+|------|----------|-------------|
+| Open | Ctrl+O | Open a hyperspectral datacube (`.hdr` file) |
+| Clear | Ctrl+N | Clear the current ground truth mask |
+| Save | Ctrl+S | Save the ground truth mask as PNG/TIFF |
+| Pen | P | Freehand drawing |
+| Eraser | E | Erase annotations |
+| Fill | F | Flood-fill connected region |
+| Connect | L | Draw a line between clicked points |
 
-## 📌 เกณฑ์ class
+### Navigation
 
-- class id ต้องมากกว่า 0 และไม่เกิน 255
-- class id ซ้ำไม่ได้
-- class id 0 = background / ไม่มี annotation
-- class name ใส่ได้ ไม่จำกัด
+- **Ctrl + Scroll Wheel** — Zoom in / out (5% – 5000%)
+- **Middle-click drag** — Pan the canvas
 
-## 💡 วิธีดูผล COCO JSON
+## Output Format
 
-- `build_coco_annotation_json_from_layers(...)` จาก layer data
-- output JSON format ตาม COCO ใกล้เคียง:
-  - `images`: id, file_name, width, height
-  - `annotations`: id, image_id, category_id, bbox, area, segmentation
-  - `categories`: id, name
+Saved masks are 8-bit grayscale images where each pixel value represents a class ID:
 
-`test_script/test_annotation.py` ตรวจสอบและเรนเดอร์ annotation เป็นรูปภาพ
+| Pixel value | Meaning |
+|-------------|---------|
+| `0` | Background / unannotated |
+| `1, 2, 3, …` | Class IDs assigned in the class manager |
 
-## 🛠️ ปรับจูน
+COCO JSON export is also supported (from Save dialog):
 
-- ปรับ cutoff preview ด้วย Contrast dialog แล้วระบบบันทึกค่าที่เลือก
-- ปรับ/ล็อก/ซ่อน layer ผ่าน panel
-- ภายใต้ hood: band selection ถอดจาก metadata nm; ถ้าไม่มีจะใช้ default
+- images: id, file_name, height, width
+- annotations: one object per connected polygon (category_id, bbox, area, segmentation as rect polygon)
+- categories: from class table
 
-## 🔎 ข้อควรระวังและ limitation
+## Project Structure
 
-- โหมด `cursor` ให้ลากกล่องหรือปรับไซส์ได้ใน layer ที่มี bounding box
-- `fill` mode ใน `CanvasItem` ทำงานบน mask ที่มี layer active
-- ถ้าไม่มี OpenCV (`cv2`) การคำนวณ segmentation polygon จาก mask จะ fallback เป็น bbox rectangle
-- หากไม่มี `wavelength` ใน metadata จะใช้ default SWIR/VIS lookup
+```text
+hsi_annotation/
+  app.py          # Application bootstrap
+  canvas.py       # Interactive canvas and drawing layer
+  data.py         # Datacube loading and mask/class conversions
+  ui/
+    class_table.py
+    paint_view.py
+    pg_panel.py
+    window.py     # Main window composition
+__main__.py       # Thin entry point
+```
 
-## Resuts From Annotation
-### Cube RGB
-![image](https://github.com/qthailand/coco-hsi-data-annotation/blob/main/test_script/turmeric.png)
-### Result
-![image](https://github.com/qthailand/coco-hsi-data-annotation/blob/main/test_script/coco_ann_ann_1.png)
-![image](https://github.com/qthailand/coco-hsi-data-annotation/blob/main/test_script/coco_ann_ann_2.png)
-![image](https://github.com/qthailand/coco-hsi-data-annotation/blob/main/test_script/coco_ann_ann_3.png)
-![image](https://github.com/qthailand/coco-hsi-data-annotation/blob/main/test_script/coco_ann_ann_4.png)
+## UI Layout
+
+```text
+┌─────────────────┬───────────────────┬──────────────────┐
+│  Annotation     │  Image Viewer     │  Class Manager   │
+│  Canvas         │  + Spectral Plot  │  (labels/colors) │
+└─────────────────┴───────────────────┴──────────────────┘
+```

@@ -1,8 +1,11 @@
+import logging
 import re
 
 import numpy as np
 import spectral as spy
 from PyQt5.QtGui import QImage
+
+log = logging.getLogger(__name__)
 
 
 RGB_BANDS = (29, 19, 9)
@@ -20,7 +23,12 @@ def load_datacube_preview(
     high_cut=DEFAULT_HIGH_CUT,
     target_wavelengths=None,
 ):
+    log.info("Opening datacube: %s", path)
     datacube = spy.open_image(path)
+    log.debug(
+        "Datacube opened — rows=%d  cols=%d  bands=%d",
+        datacube.nrows, datacube.ncols, datacube.nbands,
+    )
     rgb, preview_info = build_rgb_preview(
         datacube,
         low_cut=low_cut,
@@ -30,6 +38,7 @@ def load_datacube_preview(
     rgb8 = np.ascontiguousarray((rgb * 255).clip(0, 255).astype(np.uint8))
     height, width, _ = rgb8.shape
     qimg = QImage(rgb8.data, width, height, width * 3, QImage.Format_RGB888)
+    log.info("Preview rendered — %dx%d px  low=%.1f%%  high=%.1f%%", width, height, low_cut, high_cut)
     return datacube, qimg.convertToFormat(QImage.Format_ARGB32).copy(), preview_info
 
 
@@ -69,6 +78,7 @@ def select_rgb_bands(datacube, target_wavelengths=None):
         target_wavelengths = _select_default_target_wavelengths(datacube.metadata)
     wavelengths = extract_wavelengths(datacube.metadata)
     if wavelengths is None or len(wavelengths) == 0:
+        log.warning("No wavelength metadata found — falling back to default band indices %s", RGB_BANDS)
         return RGB_BANDS, None
     band_indices = []
     actual_wavelengths = []
@@ -76,44 +86,59 @@ def select_rgb_bands(datacube, target_wavelengths=None):
         index = int(np.argmin(np.abs(wavelengths - target)))
         band_indices.append(index)
         actual_wavelengths.append(float(wavelengths[index]))
+    log.debug(
+        "RGB bands selected — target=(%s)  actual=(%s)  indices=%s",
+        ", ".join(f"{w:.0f}" for w in target_wavelengths),
+        ", ".join(f"{w:.1f} nm" for w in actual_wavelengths),
+        band_indices,
+    )
     return tuple(band_indices), tuple(actual_wavelengths)
 
 
 def extract_wavelengths(metadata):
     raw_wavelengths = metadata.get("wavelength") if metadata else None
     if raw_wavelengths is None:
+        log.debug("No 'wavelength' key in metadata")
         return None
     values = _coerce_wavelength_values(raw_wavelengths)
     if not values:
+        log.warning("Could not parse wavelength values from metadata")
         return None
     wavelengths = np.asarray(values, dtype=np.float32)
     units = str(metadata.get("wavelength units", "")).strip().lower() if metadata else ""
     if _uses_micrometer_units(units, wavelengths):
+        log.debug("Wavelength units appear to be micrometres — converting to nanometres")
         wavelengths = wavelengths * 1000.0
+    log.debug("Extracted %d wavelengths  range=%.1f–%.1f nm", len(wavelengths), wavelengths.min(), wavelengths.max())
     return wavelengths
 
 
-def compute_class_spectra(datacube, mask, classes, max_samples=300, progress_callback=None):
+def compute_label_spectra(datacube, mask, labels, max_samples=300, progress_callback=None):
+    log.debug("compute_label_spectra — %d label(s)  max_samples=%d", len(labels), max_samples)
     if progress_callback is not None:
         progress_callback(0.0)
     if datacube is None:
+        log.warning("compute_label_spectra called with no datacube")
         if progress_callback is not None:
             progress_callback(1.0)
-        return [(name, color, None) for _, name, color in classes]
+        return [(name, color, None) for _, name, color in labels]
     mask_arr = _qimage_to_rgba_array(mask)
     class_data = []
-    for _, name, color in classes:
+    for _, name, color in labels:
         match = _match_color(mask_arr, color)
         ys, xs = np.where(match)
         if len(ys) == 0:
+            log.debug("  [%s] no pixels found in mask", name)
             class_data.append((name, color, None))
         else:
-            if len(ys) > max_samples:
-                idx = np.random.choice(len(ys), max_samples, replace=False)
+            n_total = len(ys)
+            if n_total > max_samples:
+                idx = np.random.choice(n_total, max_samples, replace=False)
                 ys, xs = ys[idx], xs[idx]
             valid = (xs < datacube.ncols) & (ys < datacube.nrows)
             ys, xs = ys[valid], xs[valid]
             if len(ys) == 0:
+                log.warning("  [%s] %d pixel(s) found but all out of datacube bounds", name, n_total)
                 class_data.append((name, color, None))
             else:
                 try:
@@ -123,20 +148,27 @@ def compute_class_spectra(datacube, mask, classes, max_samples=300, progress_cal
                             for y, x in zip(ys, xs)
                         ]
                     )
-                    class_data.append((name, color, spectra.mean(axis=0)))
+                    avg = spectra.mean(axis=0)
+                    log.debug(
+                        "  [%s] sampled %d/%d px — mean spectrum range=[%.4f, %.4f]",
+                        name, len(ys), n_total, avg.min(), avg.max(),
+                    )
+                    class_data.append((name, color, avg))
                 except Exception:
+                    log.exception("  [%s] failed to read spectra from datacube", name)
                     class_data.append((name, color, None))
     if progress_callback is not None:
         progress_callback(1.0)
+    log.debug("compute_label_spectra done")
     return class_data
 
 
-def build_class_id_mask(mask, classes):
+def build_label_id_mask(mask, labels):
     mask_arr = _qimage_to_rgba_array(mask)
     height, width = mask_arr.shape[:2]
     id_arr = np.zeros((height, width), dtype=np.uint8)
-    for class_id, _, color in classes:
-        id_arr[_match_color(mask_arr, color)] = class_id
+    for label_id, _, color in labels:
+        id_arr[_match_color(mask_arr, color)] = label_id
     return np.ascontiguousarray(id_arr)
 
 
@@ -200,13 +232,16 @@ def build_coco_annotations_from_mask(class_id_mask, image_id=1, segmentation_met
     return annotations
 
 
-def build_coco_annotation_json(mask, classes, image_id=1, file_name=""):
-    class_id_mask = build_class_id_mask(mask, classes)
-    height, width = class_id_mask.shape
+def build_coco_annotation_json(mask, labels, image_id=1, file_name=""):
+    log.info("Building COCO JSON — image_id=%d  file='%s'  %d label(s)", image_id, file_name, len(labels))
+    label_id_mask = build_label_id_mask(mask, labels)
+    height, width = label_id_mask.shape
     categories = [
-        {"id": int(class_id), "name": str(name), "supercategory": ""}
-        for class_id, name, _ in classes
+        {"id": int(label_id), "name": str(name), "supercategory": ""}
+        for label_id, name, _ in labels
     ]
+    annotations = build_coco_annotations_from_mask(label_id_mask, image_id=image_id)
+    log.info("COCO JSON built — %d annotation(s)", len(annotations))
     coco = {
         "info": {
             "description": "HSI annotation converted to COCO format",
@@ -215,7 +250,7 @@ def build_coco_annotation_json(mask, classes, image_id=1, file_name=""):
         },
         "licenses": [],
         "images": [{"id": image_id, "file_name": file_name or "", "height": height, "width": width}],
-        "annotations": build_coco_annotations_from_mask(class_id_mask, image_id=image_id),
+        "annotations": annotations,
         "categories": categories,
     }
     return coco
@@ -258,123 +293,6 @@ def _qimage_to_rgba_array(image):
     ptr = rgba.bits()
     ptr.setsize(height * width * 4)
     return np.frombuffer(ptr, np.uint8).reshape((height, width, 4)).copy()
-
-
-def build_coco_annotations_from_layers(layers, image_id=1):
-    annotations = []
-    annotation_id = 1  # FIX: must be globally unique across all annotations
-
-    for layer in layers:
-        if not layer.get("visible", True):
-            continue
-
-        mask = layer.get("mask")
-        if mask is None:
-            continue
-
-        arr = _qimage_to_rgba_array(mask)
-        alpha = arr[:, :, 3]
-        ys, xs = np.where(alpha > 0)
-
-        if xs.size == 0 or ys.size == 0:
-            continue
-
-        x_min = int(xs.min())
-        x_max = int(xs.max())
-        y_min = int(ys.min())
-        y_max = int(ys.max())
-        w = x_max - x_min + 1
-        h = y_max - y_min + 1
-        area = int((alpha > 0).sum())
-
-        # Pixel-level segmentation polygons from alpha mask contours
-        segmentation = _mask_to_polygons(alpha)
-        if not segmentation:
-            # fallback to bbox rectangle if cv2 unavailable or contour extraction fails
-            segmentation = [[x_min, y_min, x_max, y_min, x_max, y_max, x_min, y_max]]
-
-        class_ids = layer.get("class_ids")
-        if class_ids is None:
-            class_ids = [layer.get("class_id", 1)]
-
-        for cid in class_ids:
-            annotations.append(
-                {
-                    "id": annotation_id,  # FIX: was layer["id"], causing duplicates when class_ids > 1
-                    "image_id": int(image_id),
-                    "category_id": int(cid),
-                    "segmentation": segmentation,
-                    "area": area,
-                    "bbox": [x_min, y_min, w, h],
-                    "iscrowd": 0,
-                }
-            )
-            annotation_id += 1
-
-    return annotations
-
-
-def build_coco_annotation_json_from_layers(layers, classes=None, image_id=1, file_name=""):
-    annotations = build_coco_annotations_from_layers(layers, image_id=image_id)
-
-    if classes is None:
-        category_ids = sorted({ann["category_id"] for ann in annotations})
-        categories = [
-            {"id": cid, "name": f"class_{cid}", "supercategory": ""}
-            for cid in category_ids
-        ]
-    else:
-        class_map = (
-            {c[0]: c[1] for c in classes}
-            if isinstance(classes, list)
-            else {k: v["name"] for k, v in classes.items()}
-        )
-        category_ids = sorted({ann["category_id"] for ann in annotations})
-        categories = [
-            {"id": cid, "name": class_map.get(cid, f"class_{cid}"), "supercategory": ""}
-            for cid in category_ids
-        ]
-
-    # FIX: find image size from first layer that actually has a valid mask
-    image_width, image_height = 0, 0
-    for layer in layers:
-        m = layer.get("mask")
-        if m is not None:
-            image_width, image_height = m.width(), m.height()
-            break
-
-    coco = {
-        
-        "info": {
-        "description": "HSI Dataset with COCO-style Annotations",
-        "url": "https://github.com/qthailand/coco-hsi-data-annotation",
-        "version": "1.0",
-        "year": 2026,
-        "contributor": "National Astronomical Research Institute of Thailand (Public Organization) And Prince of Songkla University, Thailand",
-        "date_created": "2026/04/02"
-        },  
-        "licenses": [
-        {
-            "id": 1,
-            "name": "Creative Commons Attribution 4.0",
-            "url": "https://creativecommons.org/licenses/by/4.0/"
-        }
-        ],
-        "images": [
-            {
-                "id": image_id,
-                "license": 4,
-                "width": image_width,
-                "height": image_height,
-                "file_name": file_name or "",
-                "date_captured": "2013-11-15 02:41:42",
-            }
-        ],
-        "annotations": annotations,
-        "categories": categories,
-    }
-
-    return coco
 
 
 def _match_color(mask_arr, color, tolerance=COLOR_TOLERANCE):

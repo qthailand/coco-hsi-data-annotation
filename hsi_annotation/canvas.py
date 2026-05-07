@@ -1,17 +1,48 @@
+﻿import logging
 import time
 import math
 from collections import deque
 
 import numpy as np
-from PyQt5.QtCore import QObject, QPointF, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QPointF, QRunnable, QThreadPool, Qt, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import QGraphicsPixmapItem
 
-from .data import DEFAULT_HIGH_CUT, DEFAULT_LOW_CUT, build_rgb_preview, load_datacube_preview
+from .data import (
+    DEFAULT_HIGH_CUT,
+    DEFAULT_LOW_CUT,
+    _match_color,
+    build_rgb_preview,
+    load_datacube_preview,
+)
+
+log = logging.getLogger(__name__)
+
+
+class _SpecSignals(QObject):
+    ready = pyqtSignal(int, int, object)
+
+
+class _SpectrumRunnable(QRunnable):
+    """Read a single pixel spectrum in a thread-pool worker."""
+    def __init__(self, datacube, x, y):
+        super().__init__()
+        self.signals = _SpecSignals()
+        self._datacube = datacube
+        self._x = x
+        self._y = y
+
+    def run(self):
+        try:
+            spec = np.array(self._datacube[self._y, self._x, :], dtype=np.float32).flatten()
+            self.signals.ready.emit(self._x, self._y, spec)
+        except Exception:
+            log.exception("SpectrumRunnable: failed to read pixel (%d, %d)", self._x, self._y)
 
 
 class CanvasSignals(QObject):
     updated = pyqtSignal()
+    shape_closed = pyqtSignal()   # emitted when a shape is finalised (connect closed / circle right-release / eraser up / clear)
     spectrum_ready = pyqtSignal(int, int, object)
     loaded = pyqtSignal(int, int, int)
 
@@ -46,25 +77,9 @@ class CanvasItem(QGraphicsPixmapItem):
         self._last_spectrum_emit = 0.0
         self._spectrum_interval_s = 0.06
 
-        # Drag/move state
-        self._dragging_bbox = False
-        self._dragging_tag_id = None
-        self._drag_start_pos = None
-        self._drag_start_bbox = None
-        self._drag_start_mask = None
-
-        # Resize state
-        self._resizing_bbox = False
-        self._resize_layer_id = None
-        self._resize_handle = None
-        self._resize_start_pos = None
-        self._resize_original_bbox = None   # bbox at drag-start
-        self._resize_original_mask = None   # mask at drag-start
-        self._hover_resize_zone = None
-
-        self._current_class_id = 1
-        self._current_class_name = "Class 1"
-        self._current_class_color = QColor(231, 76, 60, 220)
+        self._current_label_id = 1
+        self._current_label_name = "Label 1"
+        self._current_label_color = QColor(231, 76, 60, 220)
 
         self._pen_color = QColor(231, 76, 60, 220)
         self._pen_width = 4
@@ -74,68 +89,15 @@ class CanvasItem(QGraphicsPixmapItem):
         self._preview_info = None
         self._circle_center = None
         self._circle_radius = 0
-        self._layers = []
-        self._active_layer_id = None
-        self._next_layer_id = 1
         self._circle_base_mask = None
+        # Store per-label hidden pixel fragments for temporary hide/show
+        # key: label_id -> ndarray of shape (h,w,4) containing only the stored pixels
+        self._hidden_label_masks = {}
         self._init_mask(800, 600)
         self.setZValue(1)
         self.setOpacity(0.75)
         self.setShapeMode(QGraphicsPixmapItem.BoundingRectShape)
         self.setAcceptHoverEvents(True)
-
-    # ------------------------------------------------------------------
-    # paint() — one border per layer, drawn from bbox
-    # ------------------------------------------------------------------
-
-    def paint(self, painter, option, widget):
-        super().paint(painter, option, widget)
-        for layer in self._layers:
-            if not layer.get("visible", True):
-                continue
-            bbox = layer.get("bbox")
-            if not bbox:
-                continue
-            x, y, w, h = bbox
-
-            # Border
-            layer_color = QColor(layer.get("color", QColor(255, 0, 0)))
-            layer_color.setAlpha(200)
-            painter.setPen(QPen(layer_color, 2))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(x, y, w, h)
-
-            # Label
-            label = f"{layer.get('name', '')} ({layer.get('class_id', '')})"
-            box_color = QColor(layer_color)
-            box_color.setAlpha(180)
-            painter.setBrush(box_color)
-            painter.setPen(Qt.NoPen)
-            painter.fillRect(x, y - 18, max(1, len(label) * 7), 18, box_color)
-            painter.setPen(Qt.white)
-            painter.drawText(x + 2, y - 4, label)
-
-            # Resize handles (cursor mode only)
-            if self._tool == "cursor":
-                handle_color = (
-                    QColor(255, 255, 255, 220)
-                    if layer.get("id") == self._resize_layer_id
-                    else QColor(200, 200, 200, 160)
-                )
-                painter.setBrush(QBrush(handle_color))
-                painter.setPen(Qt.NoPen)
-                hs = max(4, self._pen_width)
-                for cx, cy in [
-                    (x,         y        ),
-                    (x + w,     y        ),
-                    (x + w,     y + h    ),
-                    (x,         y + h    ),
-                    (x + w // 2, y       ),
-                    (x + w // 2, y + h   ),
-                    (x,          y + h // 2),
-                    (x + w,      y + h // 2),
-                ]:
-                    painter.drawEllipse(QPointF(cx, cy), hs, hs)
 
     # ------------------------------------------------------------------
     # Properties
@@ -165,6 +127,11 @@ class CanvasItem(QGraphicsPixmapItem):
     def preview_high_cut(self):
         return self._preview_high_cut
 
+    @property
+    def has_active_label(self):
+        """True when a label is selected and drawing is permitted."""
+        return self._current_label_id is not None
+
     # ------------------------------------------------------------------
     # Init / setup
     # ------------------------------------------------------------------
@@ -172,24 +139,16 @@ class CanvasItem(QGraphicsPixmapItem):
     def _init_mask(self, width, height):
         self._mask = QImage(width, height, QImage.Format_ARGB32)
         self._mask.fill(0)
-        for layer in self._layers:
-            layer["mask"] = QImage(width, height, QImage.Format_ARGB32)
-            layer["mask"].fill(0)
         self.setPixmap(QPixmap.fromImage(self._mask))
 
     def set_tool(self, tool_name):
+        log.debug("Tool changed: %s", tool_name)
         self._tool = tool_name
+        self._drawing = False
         if tool_name != "connect":
             self._connect_start = None
             self._connect_last = None
             self._connect_points = []
-        if tool_name != "cursor":
-            self._resize_layer_id = None
-            self._resizing_bbox = False
-            self._resize_handle = None
-            self._resize_start_pos = None
-            self._resize_original_bbox = None
-            self._resize_original_mask = None
 
     def set_pen_color(self, color):
         self._pen_color = color
@@ -204,267 +163,39 @@ class CanvasItem(QGraphicsPixmapItem):
     def get_mask(self):
         return self._mask
 
-    # ------------------------------------------------------------------
-    # Layer management
-    # ------------------------------------------------------------------
-
-    def add_tag(self, class_id, name, color):
-        if self._mask is None:
-            return None
-        width = self._mask.width()
-        height = self._mask.height()
-        layer = {
-            "id": self._next_layer_id,
-            "class_ids": [class_id],
-            "class_id": class_id,
-            "name": name,
-            "color": QColor(color),
-            "visible": True,
-            "locked": False,
-            "mask": QImage(width, height, QImage.Format_ARGB32),
-            # bbox = tight bounding box of painted pixels (auto-updated after each stroke)
-            # None until the user paints something
-            "bbox": None,
-            "area": 0,
-        }
-        layer["mask"].fill(0)
-        self._layers.append(layer)
-        self._active_layer_id = layer["id"]
-        self._next_layer_id += 1
-        self._compose_mask()
-        self.signals.updated.emit()
-        return layer["id"]
-
-    def select_tag(self, layer_id):
-        if any(layer["id"] == layer_id for layer in self._layers):
-            self._active_layer_id = layer_id
-            return True
-        return False
-
-    def current_tag(self):
-        for layer in self._layers:
-            if layer["id"] == self._active_layer_id:
-                return layer
-        return None
-
-    def get_layers(self):
-        return self._layers
-
-    def remove_tag(self, layer_id):
-        self._layers = [l for l in self._layers if l["id"] != layer_id]
-        if self._active_layer_id == layer_id:
-            self._active_layer_id = self._layers[-1]["id"] if self._layers else None
-        self._compose_mask()
-        self.signals.updated.emit()
-
-    def toggle_visibility(self, layer_id):
-        for layer in self._layers:
-            if layer["id"] == layer_id:
-                layer["visible"] = not layer.get("visible", True)
-                break
-        self._compose_mask()
-        self.signals.updated.emit()
-
-    def toggle_lock(self, layer_id):
-        for layer in self._layers:
-            if layer["id"] == layer_id:
-                layer["locked"] = not layer.get("locked", False)
-                break
-        self.signals.updated.emit()
+    def set_current_label(self, label_id, name, color):
+        """
+        Set the active label.  Pass label_id=None to indicate "no label" —
+        drawing tools will be blocked until a valid label is set again.
+        """
+        self._current_label_id = label_id
+        self._current_label_name = name
+        if label_id is None:
+            log.info("Active label cleared — drawing disabled until a label is selected")
+            self._pen_color = QColor(0, 0, 0, 0)
+        else:
+            self._current_label_color = color
+            self._pen_color = QColor(color)
+            self._pen_color.setAlpha(220)
 
     def clear_mask(self):
         self._mask.fill(0)
-        for layer in self._layers:
-            layer["mask"].fill(0)
-        self._layers = []
-        self._active_layer_id = None
         self.setPixmap(QPixmap.fromImage(self._mask))
         self.signals.updated.emit()
-
-    # ------------------------------------------------------------------
-    # Compose
-    # ------------------------------------------------------------------
-
-    def set_current_class(self, class_id, name, color):
-        self._current_class_id = class_id
-        self._current_class_name = name
-        self._current_class_color = color
-        self._pen_color = QColor(color)
-        self._pen_color.setAlpha(220)
-
-    def _ensure_active_tag_for_current_class(self):
-        current_tag = self.current_tag()
-        if current_tag is None or current_tag.get("class_id") != self._current_class_id:
-            self.add_tag(self._current_class_id, self._current_class_name, self._current_class_color)
-
-    def _compose_mask(self):
-        if self._mask is None:
-            return
-        self._mask.fill(0)
-        painter = QPainter(self._mask)
-        painter.setRenderHint(QPainter.Antialiasing)
-        for layer in self._layers:
-            if not layer.get("visible", True):
-                continue
-            painter.drawImage(0, 0, layer["mask"])
-        painter.end()
-        self.setPixmap(QPixmap.fromImage(self._mask))
-
-    # ------------------------------------------------------------------
-    # Hit-testing & cursor
-    # ------------------------------------------------------------------
-
-    def _layer_at_point(self, pos):
-        """Return topmost layer whose bbox contains pos."""
-        for layer in reversed(self._layers):
-            bbox = layer.get("bbox")
-            if not bbox or not layer.get("visible", True):
-                continue
-            x, y, w, h = bbox
-            if x <= pos.x() <= x + w and y <= pos.y() <= y + h:
-                return layer
-        return None
-
-    def _find_resize_zone(self, pos, bbox, threshold=8):
-        """Return handle name for edges/corners of bbox, or None."""
-        if bbox is None:
-            return None
-        x, y, w, h = bbox
-        right, bottom = x + w, y + h
-        if not (x - threshold <= pos.x() <= right  + threshold and
-                y - threshold <= pos.y() <= bottom + threshold):
-            return None
-        nl = abs(pos.x() - x)      <= threshold
-        nr = abs(pos.x() - right)  <= threshold
-        nt = abs(pos.y() - y)       <= threshold
-        nb = abs(pos.y() - bottom)  <= threshold
-        if nt and nl: return "nw"
-        if nt and nr: return "ne"
-        if nb and nr: return "se"
-        if nb and nl: return "sw"
-        if nl and y + threshold < pos.y() < bottom - threshold: return "w"
-        if nr and y + threshold < pos.y() < bottom - threshold: return "e"
-        if nt and x + threshold < pos.x() < right  - threshold: return "n"
-        if nb and x + threshold < pos.x() < right  - threshold: return "s"
-        return None
-
-    def _update_hover_cursor(self, pos):
-        if self._tool != "cursor":
-            self.setCursor(Qt.ArrowCursor)
-            return
-        layer = self._layer_at_point(pos)
-        if layer is None:
-            self._hover_resize_zone = None
-            self._resize_layer_id = None
-            self.setCursor(Qt.ArrowCursor)
-            return
-        zone = self._find_resize_zone(pos, layer.get("bbox"))
-        self._hover_resize_zone = zone
-        if zone is None:
-            self._resize_layer_id = None
-            self.setCursor(Qt.SizeAllCursor)
-            return
-        self._resize_layer_id = layer.get("id")
-        cursor_map = {
-            "w":  Qt.SizeHorCursor,   "e":  Qt.SizeHorCursor,
-            "n":  Qt.SizeVerCursor,   "s":  Qt.SizeVerCursor,
-            "nw": Qt.SizeFDiagCursor, "se": Qt.SizeFDiagCursor,
-            "ne": Qt.SizeBDiagCursor, "sw": Qt.SizeBDiagCursor,
-        }
-        self.setCursor(cursor_map.get(zone, Qt.ArrowCursor))
-
-    # ------------------------------------------------------------------
-    # Resize / move computation
-    # ------------------------------------------------------------------
-
-    def _compute_new_bbox(self, cur_pos, orig_bbox, handle):
-        """Return new [x, y, w, h] given cursor, original bbox, and handle."""
-        x0, y0, w0, h0 = orig_bbox
-        dx = int(cur_pos.x() - self._resize_start_pos.x())
-        dy = int(cur_pos.y() - self._resize_start_pos.y())
-        x, y, w, h = x0, y0, w0, h0
-        if handle in ("w", "nw", "sw"):
-            w = max(1, w0 - dx);  x = x0 + (w0 - w)
-        elif handle in ("e", "ne", "se"):
-            w = max(1, w0 + dx)
-        if handle in ("n", "nw", "ne"):
-            h = max(1, h0 - dy);  y = y0 + (h0 - h)
-        elif handle in ("s", "sw", "se"):
-            h = max(1, h0 + dy)
-        x = max(0, x);  y = max(0, y)
-        w = min(self._mask.width()  - x, w)
-        h = min(self._mask.height() - y, h)
-        return [x, y, w, h]
-
-    # ------------------------------------------------------------------
-    # Mask transform helpers
-    # ------------------------------------------------------------------
-
-    def _scale_mask(self, src_mask, old_bbox, new_bbox):
-        """Scale painted region from old_bbox to new_bbox."""
-        ox, oy, ow, oh = old_bbox
-        nx, ny, nw, nh = new_bbox
-        src_cropped = src_mask.copy(ox, oy, max(1, ow), max(1, oh))
-        scaled = src_cropped.scaled(
-            max(1, nw), max(1, nh),
-            Qt.IgnoreAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        new_mask = QImage(src_mask.width(), src_mask.height(), QImage.Format_ARGB32)
-        new_mask.fill(0)
-        p = QPainter(new_mask)
-        p.drawImage(nx, ny, scaled)
-        p.end()
-        return new_mask
-
-    def _offset_mask(self, mask, dx, dy):
-        new_mask = QImage(mask.size(), QImage.Format_ARGB32)
-        new_mask.fill(0)
-        p = QPainter(new_mask)
-        p.drawImage(dx, dy, mask)
-        p.end()
-        return new_mask
-
-    def _update_bbox_from_pixels(self, layer):
-        """Auto-recompute layer['bbox'] as tight bounding box of painted pixels."""
-        mask = layer.get("mask")
-        if mask is None:
-            layer["bbox"] = None
-            layer["area"] = 0
-            return
-        mask_rgba = mask.convertToFormat(QImage.Format_RGBA8888)
-        cw, ch = mask_rgba.width(), mask_rgba.height()
-        ptr = mask_rgba.bits()
-        ptr.setsize(ch * cw * 4)
-        arr = np.frombuffer(ptr, np.uint8).reshape((ch, cw, 4)).copy()
-        alpha = arr[:, :, 3]
-        ys, xs = np.where(alpha > 0)
-        if xs.size == 0:
-            layer["bbox"] = None
-            layer["area"] = 0
-            return
-        layer["bbox"] = [
-            int(xs.min()), int(ys.min()),
-            int(xs.max() - xs.min() + 1),
-            int(ys.max() - ys.min() + 1),
-        ]
-        layer["area"] = int((alpha > 0).sum())
-
-    def _update_active_bbox(self):
-        layer = self.current_tag()
-        if layer is not None:
-            self._update_bbox_from_pixels(layer)
+        self.signals.shape_closed.emit()
 
     # ------------------------------------------------------------------
     # Datacube / preview
     # ------------------------------------------------------------------
 
     def load_datacube(self, path):
+        log.info("CanvasItem.load_datacube: %s", path)
         self._datacube, rgb_img, self._preview_info = load_datacube_preview(
             path, low_cut=self._preview_low_cut, high_cut=self._preview_high_cut,
         )
         self._init_mask(rgb_img.width(), rgb_img.height())
         self._is_loaded = True
+        log.info("Datacube loaded — %dx%d px  %d bands", rgb_img.width(), rgb_img.height(), self._datacube.nbands)
         self.signals.loaded.emit(rgb_img.width(), rgb_img.height(), self._datacube.nbands)
         return rgb_img
 
@@ -485,6 +216,7 @@ class CanvasItem(QGraphicsPixmapItem):
         ).convertToFormat(QImage.Format_ARGB32).copy()
 
     def _emit_spectrum(self, pos, force=False):
+        """Schedule a pixel-spectrum read on a thread-pool worker to avoid blocking the UI."""
         if self._datacube is None:
             return
         now = time.perf_counter()
@@ -492,9 +224,11 @@ class CanvasItem(QGraphicsPixmapItem):
             return
         x, y = int(pos.x()), int(pos.y())
         if 0 <= x < self._datacube.ncols and 0 <= y < self._datacube.nrows:
-            spec = np.array(self._datacube[y, x, :], dtype=np.float32).flatten()
             self._last_spectrum_emit = now
-            self.signals.spectrum_ready.emit(x, y, spec)
+            worker = _SpectrumRunnable(self._datacube, x, y)
+            # QueuedConnection ensures the result is delivered on the main-thread event loop
+            worker.signals.ready.connect(self.signals.spectrum_ready, Qt.QueuedConnection)
+            QThreadPool.globalInstance().start(worker)
 
     # ------------------------------------------------------------------
     # Mouse events
@@ -504,13 +238,12 @@ class CanvasItem(QGraphicsPixmapItem):
         if not self._is_loaded:
             return
         if event.button() == Qt.LeftButton:
-            if self._tool in ("fill", "connect", "circle", "pen", "eraser"):
-                self._ensure_active_tag_for_current_class()
+            # Eraser works without a label; all paint tools require one
+            if self._tool != "eraser" and not self.has_active_label:
+                log.warning("Drawing blocked: no active label")
+                return
 
-            if self._tool == "fill":
-                self.flood_fill(event.pos())
-
-            elif self._tool == "connect":
+            if self._tool == "connect":
                 self._connect_click(event.pos())
                 self._emit_spectrum(event.pos(), force=True)
 
@@ -522,34 +255,7 @@ class CanvasItem(QGraphicsPixmapItem):
                 self._draw_circle_preview(0)
                 self._emit_spectrum(event.pos(), force=True)
 
-            elif self._tool == "cursor":
-                layer = self._layer_at_point(event.pos())
-                zone = self._find_resize_zone(
-                    event.pos(), layer.get("bbox") if layer else None
-                ) if layer else None
-
-                if layer and zone is not None:
-                    # Start resize — save original bbox + mask
-                    self._resizing_bbox = True
-                    self._resize_handle = zone
-                    self._resize_layer_id = layer.get("id")
-                    self._resize_start_pos = event.pos()
-                    self._resize_original_bbox = list(layer["bbox"])
-                    self._resize_original_mask = layer["mask"].copy()
-                    self.signals.updated.emit()
-                    return
-
-                if layer:
-                    # Start move
-                    self._dragging_bbox = True
-                    self._dragging_tag_id = layer.get("id")
-                    self._drag_start_pos = event.pos()
-                    self._drag_start_bbox = list(layer["bbox"])
-                    self._drag_start_mask = layer["mask"].copy()
-
-                self._emit_spectrum(event.pos(), force=True)
-
-            else:
+            elif self._tool == "eraser":
                 self._drawing = True
                 self._last_pos = event.pos()
                 self._draw_dot(event.pos())
@@ -564,8 +270,9 @@ class CanvasItem(QGraphicsPixmapItem):
     def hoverMoveEvent(self, event):
         if not self._is_loaded:
             return
-        self._update_hover_cursor(event.pos())
-        self.signals.updated.emit()
+        self._emit_spectrum(event.pos())
+        # Do NOT emit signals.updated here — that would rebuild bboxes and
+        # trigger label-spectra computation on every mouse-move event.
 
     def mouseMoveEvent(self, event):
         if not self._is_loaded:
@@ -579,46 +286,6 @@ class CanvasItem(QGraphicsPixmapItem):
                 self._draw_circle_preview(self._circle_radius)
             return
 
-        if self._tool == "cursor":
-            if self._resizing_bbox and self._resize_handle is not None:
-                layer = next(
-                    (l for l in self._layers if l.get("id") == self._resize_layer_id), None
-                )
-                if layer is not None:
-                    # Live: update bbox and scale mask each frame
-                    new_bbox = self._compute_new_bbox(
-                        event.pos(), self._resize_original_bbox, self._resize_handle
-                    )
-                    layer["bbox"] = new_bbox
-                    if self._resize_original_mask is not None:
-                        layer["mask"] = self._scale_mask(
-                            self._resize_original_mask,
-                            self._resize_original_bbox,
-                            new_bbox,
-                        )
-                    self._compose_mask()
-                self.signals.updated.emit()
-                return
-
-            if self._dragging_bbox and self._dragging_tag_id is not None:
-                dx = int(event.pos().x() - self._drag_start_pos.x())
-                dy = int(event.pos().y() - self._drag_start_pos.y())
-                layer = next(
-                    (l for l in self._layers if l.get("id") == self._dragging_tag_id), None
-                )
-                if layer is not None and self._drag_start_bbox is not None:
-                    x0, y0, w0, h0 = self._drag_start_bbox
-                    layer["bbox"] = [x0 + dx, y0 + dy, w0, h0]
-                    if self._drag_start_mask is not None:
-                        layer["mask"] = self._offset_mask(self._drag_start_mask, dx, dy)
-                    self._compose_mask()
-                self._emit_spectrum(event.pos())
-                return
-
-            self._update_hover_cursor(event.pos())
-            self._emit_spectrum(event.pos())
-            return
-
         if self._tool in ("fill", "connect"):
             return
 
@@ -629,9 +296,10 @@ class CanvasItem(QGraphicsPixmapItem):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
-            if self._tool in ("pen", "eraser"):
+            if self._tool == "eraser":
                 self._drawing = False
                 self.signals.updated.emit()
+                self.signals.shape_closed.emit()
 
             elif self._tool == "circle":
                 if self._drawing:
@@ -641,51 +309,16 @@ class CanvasItem(QGraphicsPixmapItem):
                 self._circle_radius = 0
                 self._circle_base_mask = None
                 self.signals.updated.emit()
+                # NOTE: label-spectra are computed on right-mouse release (see below)
 
-            elif self._tool == "cursor":
-                if self._resizing_bbox:
-                    # Resize done — recalculate bbox tightly from painted pixels
-                    layer = next(
-                        (l for l in self._layers if l.get("id") == self._resize_layer_id), None
-                    )
-                    if layer is not None:
-                        self._update_bbox_from_pixels(layer)
-                    self._resizing_bbox = False
-                    self._resize_handle = None
-                    self._resize_start_pos = None
-                    self._resize_original_bbox = None
-                    self._resize_original_mask = None
-                    self.signals.updated.emit()
-                    return
-
-                if self._dragging_bbox:
-                    # Move done — recalculate bbox from pixels
-                    layer = next(
-                        (l for l in self._layers if l.get("id") == self._dragging_tag_id), None
-                    )
-                    if layer is not None:
-                        self._update_bbox_from_pixels(layer)
-
-                self._dragging_bbox = False
-                self._dragging_tag_id = None
-                self._drag_start_pos = None
-                self._drag_start_bbox = None
-                self._drag_start_mask = None
-                self.signals.updated.emit()
+        elif event.button() == Qt.RightButton and self._tool == "circle":
+            # Circle is already committed on left-release; right-release is the
+            # explicit trigger to compute label spectra (keeps drawing fluid).
+            self.signals.shape_closed.emit()
 
     # ------------------------------------------------------------------
     # Drawing helpers
     # ------------------------------------------------------------------
-
-    def _ensure_layer_mask(self, layer):
-        if layer is None:
-            return False
-        if layer.get("mask") is None:
-            layer["mask"] = QImage(
-                self._mask.width(), self._mask.height(), QImage.Format_RGBA8888
-            )
-            layer["mask"].fill(QColor(0, 0, 0, 0))
-        return True
 
     def _make_pen(self):
         if self._tool == "eraser":
@@ -695,15 +328,9 @@ class CanvasItem(QGraphicsPixmapItem):
         color.setAlpha(220)
         return QPen(color, self._pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
 
-    def _paint_on_layer(self, painter_fn):
-        """Paint onto the active layer mask. No clipping — full canvas is the canvas."""
-        layer = self.current_tag()
-        if layer is None or layer.get("locked", False):
-            return
-        if not self._ensure_layer_mask(layer):
-            return
-        mask = layer.get("mask")
-        painter = QPainter(mask)
+    def _paint_on_mask(self, painter_fn):
+        """Paint directly onto the shared mask."""
+        painter = QPainter(self._mask)
         if self._tool == "eraser":
             painter.setCompositionMode(QPainter.CompositionMode_Clear)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -711,35 +338,121 @@ class CanvasItem(QGraphicsPixmapItem):
             painter.setPen(self._make_pen())
         painter_fn(painter)
         painter.end()
-        self._compose_mask()
+        self.setPixmap(QPixmap.fromImage(self._mask))
+
+    def recolor_label_pixels(self, old_color, new_color):
+        if self._mask is None:
+            return
+        image = self._mask.convertToFormat(QImage.Format_RGBA8888)
+        width, height = image.width(), image.height()
+        ptr = image.bits()
+        ptr.setsize(height * width * 4)
+        arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 4)).copy()
+        mask = _match_color(arr, QColor(*old_color, alpha=255))
+        if not np.any(mask):
+            return
+        new_rgb = np.array(new_color, dtype=np.uint8)
+        arr[mask, :3] = new_rgb
+        self._mask = QImage(
+            arr.data, width, height, width * 4, QImage.Format_RGBA8888
+        ).copy().convertToFormat(QImage.Format_ARGB32)
+        self.setPixmap(QPixmap.fromImage(self._mask))
+        self.signals.updated.emit()
+
+    def hide_label(self, label_id, color_tuple):
+        """Temporarily hide all pixels of a label by storing their RGBA values
+        and setting those pixels to transparent in the shared mask.
+        """
+        if self._mask is None:
+            return
+        image = self._mask.convertToFormat(QImage.Format_RGBA8888)
+        width, height = image.width(), image.height()
+        ptr = image.bits()
+        ptr.setsize(height * width * 4)
+        arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 4)).copy()
+        hit = _match_color(arr, QColor(*color_tuple, alpha=255))
+        n = int(np.count_nonzero(hit))
+        if n == 0:
+            log.debug("hide_label: no pixels found for label %s", label_id)
+            return
+        # store fragment
+        frag = np.zeros_like(arr, dtype=np.uint8)
+        frag[hit] = arr[hit]
+        self._hidden_label_masks[label_id] = frag
+        # clear pixels in main mask
+        arr[hit] = 0
+        self._mask = QImage(
+            arr.data, width, height, width * 4, QImage.Format_RGBA8888
+        ).copy().convertToFormat(QImage.Format_ARGB32)
+        self.setPixmap(QPixmap.fromImage(self._mask))
+        log.info("hide_label: hid %d pixels for label %s", n, label_id)
+        self.signals.updated.emit()
+
+    def show_label(self, label_id):
+        """Restore previously hidden pixels for label_id (if any)."""
+        if self._mask is None:
+            return
+        frag = self._hidden_label_masks.get(label_id)
+        if frag is None:
+            log.debug("show_label: no stored fragment for label %s", label_id)
+            return
+        image = self._mask.convertToFormat(QImage.Format_RGBA8888)
+        width, height = image.width(), image.height()
+        ptr = image.bits()
+        ptr.setsize(height * width * 4)
+        arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 4)).copy()
+        mask_frag = frag[:, :, 3] > 0
+        arr[mask_frag] = frag[mask_frag]
+        self._mask = QImage(
+            arr.data, width, height, width * 4, QImage.Format_RGBA8888
+        ).copy().convertToFormat(QImage.Format_ARGB32)
+        self.setPixmap(QPixmap.fromImage(self._mask))
+        del self._hidden_label_masks[label_id]
+        log.info("show_label: restored pixels for label %s", label_id)
+        self.signals.updated.emit()
+
+    def erase_label_pixels(self, color_tuple):
+        """Erase all pixels matching color_tuple (R,G,B) from the mask (set to transparent)."""
+        if self._mask is None:
+            return
+        image = self._mask.convertToFormat(QImage.Format_RGBA8888)
+        width, height = image.width(), image.height()
+        ptr = image.bits()
+        ptr.setsize(height * width * 4)
+        arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 4)).copy()
+        hit = _match_color(arr, QColor(*color_tuple, alpha=255))
+        n = int(np.count_nonzero(hit))
+        if n == 0:
+            log.debug("erase_label_pixels: no pixels found for color %s", color_tuple)
+            return
+        arr[hit] = 0  # fully transparent
+        self._mask = QImage(
+            arr.data, width, height, width * 4, QImage.Format_RGBA8888
+        ).copy().convertToFormat(QImage.Format_ARGB32)
+        self.setPixmap(QPixmap.fromImage(self._mask))
+        log.info("erase_label_pixels: erased %d pixel(s) for color %s", n, color_tuple)
+        self.signals.updated.emit()
+        self.signals.shape_closed.emit()
 
     def _draw_dot(self, pos):
-        self._paint_on_layer(lambda p: p.drawPoint(pos))
-        self._update_active_bbox()
+        self._paint_on_mask(lambda p: p.drawPoint(pos))
 
     def _draw_line(self, p1, p2):
-        self._paint_on_layer(lambda p: p.drawLine(p1, p2))
-        self._update_active_bbox()
+        self._paint_on_mask(lambda p: p.drawLine(p1, p2))
 
     def _paint_circle(self, center, radius):
         if center is None or radius <= 0:
             return
-        layer = self.current_tag()
-        if layer is None or layer.get("locked", False):
-            return
-        if not self._ensure_layer_mask(layer):
-            return
-        mask = layer.get("mask")
-        painter = QPainter(mask)
+        painter = QPainter(self._mask)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(Qt.NoPen)
         color = QColor(self._pen_color)
         color.setAlpha(220)
+        painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(color))
         painter.drawEllipse(center, radius, radius)
         painter.end()
-        self._compose_mask()
-        self._update_active_bbox()
+        self.setPixmap(QPixmap.fromImage(self._mask))
+        self.signals.updated.emit()
 
     def _draw_circle_preview(self, radius):
         if self._circle_center is None or self._circle_base_mask is None:
@@ -747,26 +460,38 @@ class CanvasItem(QGraphicsPixmapItem):
         preview_mask = self._circle_base_mask.copy()
         painter = QPainter(preview_mask)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(Qt.NoPen)
         color = QColor(self._pen_color)
         color.setAlpha(220)
+        painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(color))
         painter.drawEllipse(self._circle_center, radius, radius)
         painter.end()
         self.setPixmap(QPixmap.fromImage(preview_mask))
 
-    def _connect_click(self, pos):
-        tag = self.current_tag()
-        if tag is None or tag.get("locked", False):
+    def _fill_connect_polygon(self):
+        if len(self._connect_points) < 3:
             return
+        painter = QPainter(self._mask)
+        painter.setRenderHint(QPainter.Antialiasing)
+        color = QColor(self._pen_color)
+        color.setAlpha(220)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(color))
+        painter.drawPolygon(QPolygonF(self._connect_points))
+        painter.end()
+        self.setPixmap(QPixmap.fromImage(self._mask))
+
+    def _connect_click(self, pos):
         if self._connect_last is None and self._connect_points:
             self._connect_points = []
             self._connect_start = None
         point = QPointF(pos)
         if self._connect_last is None:
+            # First point of a new path — mark as actively drawing
             self._connect_start = QPointF(point)
             self._connect_last = QPointF(point)
             self._connect_points = [QPointF(point)]
+            self._drawing = True
             self._draw_dot(point)
             self.signals.updated.emit()
             return
@@ -774,49 +499,42 @@ class CanvasItem(QGraphicsPixmapItem):
             dx = point.x() - self._connect_start.x()
             dy = point.y() - self._connect_start.y()
             if math.hypot(dx, dy) <= max(5.0, self._pen_width):
+                # Auto-close: clicked near the start point
                 self._draw_line(self._connect_last, self._connect_start)
                 self._connect_points.append(QPointF(self._connect_start))
                 self._fill_connect_polygon()
                 self._connect_start = None
                 self._connect_last = None
                 self._connect_points = []
+                self._drawing = False
                 self.signals.updated.emit()
+                self.signals.shape_closed.emit()
+                log.debug("Connect path auto-closed (clicked near start)")
                 return
         self._draw_line(self._connect_last, point)
         self._connect_last = QPointF(point)
         self._connect_points.append(QPointF(point))
         self.signals.updated.emit()
 
-    def _fill_connect_polygon(self):
-        if len(self._connect_points) < 3:
-            return
-        points = QPolygonF(self._connect_points)
-        def fill_polygon(painter):
-            color = QColor(self._pen_color)
-            color.setAlpha(220)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(color))
-            painter.drawPolygon(points)
-        self._paint_on_layer(fill_polygon)
-        self._update_active_bbox()
-
     def _close_connect_path(self):
-        tag = self.current_tag()
-        if tag is None or tag.get("locked", False):
-            return
         if self._connect_last is None or self._connect_start is None:
             self._connect_start = None
             self._connect_last = None
             self._connect_points = []
+            self._drawing = False
             return
         if self._connect_last != self._connect_start:
             self._draw_line(self._connect_last, self._connect_start)
-        if len(self._connect_points) >= 3:
+        n_pts = len(self._connect_points)
+        if n_pts >= 3:
             self._fill_connect_polygon()
         self._connect_start = None
         self._connect_last = None
         self._connect_points = []
+        self._drawing = False
         self.signals.updated.emit()
+        self.signals.shape_closed.emit()
+        log.debug("Connect path closed via right-click (%d points)", n_pts)
 
     # ------------------------------------------------------------------
     # Flood fill
